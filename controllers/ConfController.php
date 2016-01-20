@@ -3,11 +3,14 @@
 namespace app\controllers;
 
 use yii;
+use yii\web\NotFoundHttpException;
 use yii\data\Pagination;
 use app\components\Controller;
 use app\models\Project;
 use app\models\User;
 use app\models\Group;
+use app\components\GlobalHelper;
+
 
 class ConfController extends Controller
 {
@@ -18,8 +21,8 @@ class ConfController extends Controller
      */
     public function beforeAction($action) {
         parent::beforeAction($action);
-        if (\Yii::$app->user->identity->role != User::ROLE_ADMIN) {
-            throw new \Exception('非管理员不能操作：（');
+        if (!GlobalHelper::isValidAdmin()) {
+            throw new \Exception(yii::t('conf', 'you are not active'));
         }
         return true;
     }
@@ -29,10 +32,11 @@ class ConfController extends Controller
      *
      */
     public function actionIndex() {
-        $project = Project::find();
+        $project = Project::find()
+            ->where(['user_id' => $this->uid]);
         $kw = \Yii::$app->request->post('kw');
         if ($kw) {
-            $project->where(['like', "name", $kw]);
+            $project->andWhere(['like', "name", $kw]);
         }
         $project = $project->asArray()->all();
         return $this->render('index', [
@@ -49,11 +53,25 @@ class ConfController extends Controller
      */
     public function actionPreview($projectId) {
         $this->layout = 'modal';
-        $project = Project::findOne($projectId);
-        if (!$project) throw new \Exception('找不到项目');
+        $project = $this->findModel($projectId);
 
         return $this->render('preview', [
             'conf' => $project,
+        ]);
+    }
+
+    /**
+     * 项目配置检测
+     *
+     * @param $projectId
+     * @return string
+     * @throws \Exception
+     */
+    public function actionDetection($projectId) {
+        $this->layout = 'modal';
+        $project = $this->findModel($projectId);
+        return $this->render('detection', [
+            'project' => $project,
         ]);
     }
 
@@ -66,13 +84,7 @@ class ConfController extends Controller
      */
     public function actionGroup($projectId) {
         // 配置信息
-        $project = Project::findOne($projectId);
-        if (!$project) {
-            throw new \Exception('项目不存在：）');
-        }
-        if ($project->user_id != $this->uid) {
-            throw new \Exception('不可以操作其它人的项目：）');
-        }
+        $project = $this->findModel($projectId);
         // 添加用户
         if (\Yii::$app->request->getIsPost() && \Yii::$app->request->post('user')) {
             Group::addGroupUser($projectId, \Yii::$app->request->post('user'));
@@ -105,18 +117,40 @@ class ConfController extends Controller
      * @throws \Exception
      */
     public function actionEdit($projectId = null) {
-        $project = $projectId ? Project::findOne($projectId) : new Project();
+        if ($projectId) {
+            $project = $this->findModel($projectId);
+        } else {
+            $project = new Project();
+            $project->loadDefaultValues();
+        }
+
         if (\Yii::$app->request->getIsPost() && $project->load(Yii::$app->request->post())) {
             $project->user_id = $this->uid;
             if ($project->save()) {
-                $this->redirect('/conf/');
+                $this->redirect('@web/conf/');
             }
         }
 
-        if ($projectId && !$project) throw new \Exception('找不到项目配置');
         return $this->render('edit', [
             'conf' => $project,
         ]);
+    }
+
+    /**
+     * 复制项目配置
+     *
+     * @return string
+     * @throws \Exception
+     */
+    public function actionCopy($projectId) {
+        $project = $this->findModel($projectId);
+        // 复制为新项目
+        $project->name .= ' - copy';
+        $copy = new Project();
+        $copy->load($project->getAttributes(), '');
+
+        if (!$copy->save()) throw new \Exception(yii::t('conf', 'copy failed'));
+        $this->renderJson([]);
     }
 
     /**
@@ -126,14 +160,8 @@ class ConfController extends Controller
      * @throws \Exception
      */
     public function actionDelete($projectId) {
-        $project = Project::findOne($projectId);
-        if (!$project) {
-            throw new \Exception('项目不存在：）');
-        }
-        if ($project->user_id != $this->uid) {
-            throw new \Exception('不可以操作其它人的项目：）');
-        }
-        if (!$project->delete()) throw new \Exception('删除失败');
+        $project = $this->findModel($projectId);
+        if (!$project->delete()) throw new \Exception(yii::t('w', 'delete failed'));
         $this->renderJson([]);
     }
 
@@ -146,14 +174,14 @@ class ConfController extends Controller
     public function actionDeleteRelation($id) {
         $group = Group::findOne($id);
         if (!$group) {
-            throw new \Exception('关系不存在：）');
+            throw new \Exception(yii::t('conf', 'relation not exists'));
         }
         $project = Project::findOne($group->project_id);
         if ($project->user_id != $this->uid) {
-            throw new \Exception('不可以操作其它人的项目：）');
+            throw new \Exception(yii::t('conf', 'you are not master of project'));
         }
 
-        if (!$group->delete()) throw new \Exception('删除失败');
+        if (!$group->delete()) throw new \Exception(yii::t('w', 'delete failed'));
         $this->renderJson([]);
     }
 
@@ -166,17 +194,35 @@ class ConfController extends Controller
     public function actionEditRelation($id, $type = 0) {
         $group = Group::findOne($id);
         if (!$group) {
-            throw new \Exception('关系不存在：）');
+            throw new \Exception(yii::t('conf', 'relation not exists'));
         }
         $project = Project::findOne($group->project_id);
         if ($project->user_id != $this->uid) {
-            throw new \Exception('不可以操作其它人的项目：）');
+            throw new \Exception(yii::t('w', 'you are not master of project'));
         }
         if (!in_array($type, [Group::TYPE_ADMIN, Group::TYPE_USER])) {
-            throw new \Exception('未知的关系类型：）');
+            throw new \Exception(yii::t('conf', 'unknown relation type'));
         }
         $group->type = (int)$type;
-        if (!$group->save()) throw new \Exception('更新失败');
+        if (!$group->save()) throw new \Exception(yii::t('w', 'update failed'));
         $this->renderJson([]);
+    }
+
+    /**
+     * 简化
+     *
+     * @param integer $id
+     * @return the loaded model
+     * @throws NotFoundHttpException if the model cannot be found
+     */
+    protected function findModel($id) {
+        if (($model = Project::getConf($id)) !== null) {
+            if ($model->user_id != $this->uid) {
+                throw new \Exception(yii::t('w', 'you are not master of project'));
+            }
+            return $model;
+        } else {
+            throw new NotFoundHttpException(yii::t('conf', 'project not exists'));
+        }
     }
 }

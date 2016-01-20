@@ -19,26 +19,42 @@ class Folder extends Command {
      * @return bool
      */
     public function initLocalWorkspace($version) {
-        $command = 'mkdir -p ' . Project::getDeployWorkspace($version);
+        // svn
+        if ($this->config->repo_type == Project::REPO_SVN) {
+            $cmd[] = 'mkdir -p ' . Project::getDeployWorkspace($version);
+            $cmd[] = sprintf('mkdir -p %s-svn', rtrim(Project::getDeployWorkspace($version), '/'));
+        }
+        // git 直接把项目代码拷贝过来，然后更新，取代之前原项目检出，提速
+        else {
+            $cmd[] = sprintf('cp -rf %s %s ', Project::getDeployFromDir(), Project::getDeployWorkspace($version));
+        }
+        $command = join(' && ', $cmd);
         return $this->runLocalCommand($command);
     }
 
     /**
      * 目标机器的版本库初始化
+     * 这里会有点特殊化：
+     * 1.（git只需要生成版本目录即可）new：好吧，现在跟2一样了，毕竟本地的copy要比rsync要快，到时只需要rsync做增量更新即可
+     * 2.svn还需要把线上版本复制到1生成的版本目录中，做增量发布
      *
      * @author wushuiyong
      * @param $log
      * @return bool
      */
     public function initRemoteVersion($version) {
-        $command = sprintf('mkdir -p %s', Project::getReleaseVersionDir($version));
-        return $this->runRemoteCommand($command);
+        $cmd[] = sprintf('mkdir -p %s', Project::getReleaseVersionDir($version));
+        if ($this->config->repo_type == Project::REPO_SVN) {
+            $cmd[] = sprintf('test -d %s && cp -rf %s/* %s/ || echo 1', // 无论如何总得要$?执行成功
+                $this->config->release_to, $this->config->release_to, Project::getReleaseVersionDir($version));
+        }
+        $command = join(' && ', $cmd);
 
+        return $this->runRemoteCommand($command);
     }
 
     /**
      * rsync 同步文件
-     * 后续ssh -p参数的端口可以加入可配置，可能会出现非22端口
      *
      * @param $remoteHost 远程host，格式：host 、host:port
      * @return bool
@@ -46,7 +62,8 @@ class Folder extends Command {
     public function syncFiles($remoteHost, $version) {
         $excludes = GlobalHelper::str2arr($this->getConfig()->excludes);
 
-        $command = sprintf('rsync -avz --rsh="ssh -p 22" %s %s %s%s:%s',
+        $command = sprintf('rsync -avzq --rsh="ssh -p %s" %s %s %s%s:%s',
+            $this->getHostPort($remoteHost),
             $this->excludes($excludes),
             rtrim(Project::getDeployWorkspace($version), '/') . '/',
             $this->getConfig()->release_user . '@',
@@ -62,18 +79,17 @@ class Folder extends Command {
      * @param null $version
      * @return bool
      */
-    public function link($version) {
-        $user = $this->getConfig()->release_user;
-        $project = Project::getGitProjectName($this->getConfig()->git_url);
+    public function getLinkCommand($version) {
+        $user = $this->config->release_user;
+        $project = Project::getGitProjectName($this->getConfig()->repo_url);
         $currentTmp = sprintf('%s/%s/current-%s.tmp', rtrim($this->getConfig()->release_library, '/'), $project, $project);
         // 遇到回滚，则使用回滚的版本version
         $linkFrom = Project::getReleaseVersionDir($version);
         $cmd[] = sprintf('ln -sfn %s %s', $linkFrom, $currentTmp);
         $cmd[] = sprintf('chown -h %s %s', $user, $currentTmp);
         $cmd[] = sprintf('mv -fT %s %s', $currentTmp, $this->getConfig()->release_to);
-        $command = join(' && ', $cmd);
 
-        return $this->runRemoteCommand($command);
+        return join(' && ', $cmd);
     }
 
     /**
@@ -98,7 +114,7 @@ class Folder extends Command {
     protected function excludes($excludes) {
         $excludesRsync = '';
         foreach ($excludes as $exclude) {
-            $excludesRsync .= sprintf(" --exclude=%s", escapeshellarg(trim($exclude)));
+            $excludesRsync .= sprintf(" --exclude=%s ", escapeshellarg(trim($exclude)));
         }
 
 
@@ -111,9 +127,24 @@ class Folder extends Command {
      * @param $version
      * @return bool|int
      */
-    public function cleanUp($version) {
-        $command = "rm -rf " . Project::getDeployWorkspace($version);
+    public function cleanUpLocal($version) {
+        $cmd[] = "rm -rf " . Project::getDeployWorkspace($version);
+        if ($this->config->repo_type == Project::REPO_SVN) {
+            $cmd[] = sprintf('rm -rf %s-svn', rtrim(Project::getDeployWorkspace($version), '/'));
+        }
+        $command = join(' && ', $cmd);
+        return $this->runLocalCommand($command);
+    }
 
+    /**
+     * 删除本地项目空间
+     *
+     * @param $projectDir
+     * @return bool|int
+     */
+    public function removeLocalProjectWorkspace($projectDir) {
+        $cmd[] = "rm -rf " . $projectDir;
+        $command = join(' && ', $cmd);
         return $this->runLocalCommand($command);
     }
 }

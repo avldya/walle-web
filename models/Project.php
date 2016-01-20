@@ -2,6 +2,7 @@
 
 namespace app\models;
 
+use app\components\Folder;
 use app\components\GlobalHelper;
 use Yii;
 use yii\behaviors\TimestampBehavior;
@@ -26,8 +27,10 @@ use yii\db\Expression;
  * @property string $pre_deploy
  * @property string $post_deploy
  * @property string $post_release
- * @property string $git_type
+ * @property string $repo_mode
+ * @property string $repo_type
  * @property integer $audit
+ * @property integer $keep_version_num
  */
 class Project extends \yii\db\ActiveRecord
 {
@@ -48,9 +51,13 @@ class Project extends \yii\db\ActiveRecord
 
     const AUDIT_NO = 2;
 
-    const GIT_BRANCH = 'branch';
+    const REPO_BRANCH = 'branch';
 
-    const GIT_TAG = 'tag';
+    const REPO_TAG = 'tag';
+
+    const REPO_GIT = 'git';
+
+    const REPO_SVN = 'svn';
 
     public static $CONF;
 
@@ -89,13 +96,16 @@ class Project extends \yii\db\ActiveRecord
     public function rules()
     {
         return [
-            [['user_id', 'git_url', 'name', 'level', 'deploy_from', 'release_user', 'release_to', 'release_library', 'hosts'], 'required'],
-            [['user_id', 'level', 'status', 'audit'], 'integer'],
-            [['name', 'version'], 'string', 'max' => 20],
-            [['excludes', 'hosts', 'pre_deploy', 'post_deploy', 'post_release'], 'string'],
+            [['user_id', 'repo_url', 'name', 'level', 'deploy_from', 'release_user', 'release_to', 'release_library', 'hosts', 'keep_version_num'], 'required'],
+            [['user_id', 'level', 'status', 'audit', 'keep_version_num'], 'integer'],
+            [['excludes', 'hosts', 'pre_deploy', 'post_deploy', 'pre_release', 'post_release'], 'string'],
             [['created_at', 'updated_at'], 'safe'],
-            [['git_url', 'deploy_from', 'release_to', 'release_library'], 'string', 'max' => 200],
-            [['release_user', 'git_type'], 'string', 'max' => 50],
+            [['name', 'repo_password'], 'string', 'max' => 100],
+            [['version'], 'string', 'max' => 20],
+            ['repo_type', 'default', 'value' => self::REPO_GIT],
+            [['deploy_from', 'release_to', 'release_library', 'repo_url'], 'string', 'max' => 200],
+            [['release_user', 'repo_mode', 'repo_username'], 'string', 'max' => 50],
+            [['repo_type'], 'string', 'max' => 10],
         ];
     }
 
@@ -118,11 +128,16 @@ class Project extends \yii\db\ActiveRecord
             'release_to'      => '代码的webroot',
             'release_library' => '发布版本库',
             'hosts'           => '目标机器',
-            'pre_deploy'      => '部署前置任务',
-            'post_deploy'     => '同步前置任务',
-            'post_release'    => '同步后置任务',
-            'git_type'        => '分支/tag',
+            'pre_deploy'      => '宿主机代码检出前置任务',
+            'post_deploy'     => '宿主机同步前置任务',
+            'pre_release'     => '目标机更新版本前置任务',
+            'post_release'    => '目标机更新版本后置任务',
+            'repo_url'        => 'git/svn地址',
+            'repo_username'   => 'svn用户名',
+            'repo_password'   => 'svn密码',
+            'repo_mode'       => '分支/tag',
             'audit'           => '任务需要审核？',
+            'keep_version_num' => '线上版本保留数',
         ];
     }
 
@@ -150,7 +165,7 @@ class Project extends \yii\db\ActiveRecord
             return $match[1];
         }
 
-        return $gitUrl;
+        return basename($gitUrl);;
     }
 
     /**
@@ -162,7 +177,7 @@ class Project extends \yii\db\ActiveRecord
     public static function getDeployWorkspace($version) {
         $from    = static::$CONF->deploy_from;
         $env     = isset(static::$LEVEL[static::$CONF->level]) ? static::$LEVEL[static::$CONF->level] : 'unknow';
-        $project = static::getGitProjectName(static::$CONF->git_url);
+        $project = static::getGitProjectName(static::$CONF->repo_url);
 
         return sprintf("%s/%s/%s-%s", rtrim($from, '/'), rtrim($env, '/'), $project, $version);
     }
@@ -176,9 +191,21 @@ class Project extends \yii\db\ActiveRecord
     public static function getDeployFromDir() {
         $from    = static::$CONF->deploy_from;
         $env     = isset(static::$LEVEL[static::$CONF->level]) ? static::$LEVEL[static::$CONF->level] : 'unknow';
-        $project = static::getGitProjectName(static::$CONF->git_url);
+        $project = static::getGitProjectName(static::$CONF->repo_url);
 
         return sprintf("%s/%s/%s", rtrim($from, '/'), rtrim($env, '/'), $project);
+    }
+
+
+    /**
+     * 获取目标机要发布的目录
+     * {webroot}
+     *
+     * @param $version
+     * @return string
+     */
+    public static function getTargetWorkspace() {
+        return rtrim(static::$CONF->release_to, '/');
     }
 
     /**
@@ -188,11 +215,9 @@ class Project extends \yii\db\ActiveRecord
      * @param $version
      * @return string
      */
-    public static function getReleaseVersionDir($version = null) {
-        $version = $version ?: static::$CONF->link_id;
-
+    public static function getReleaseVersionDir($version = '') {
         return sprintf('%s/%s/%s', rtrim(static::$CONF->release_library, '/'),
-            static::getGitProjectName(static::$CONF->git_url), $version);
+            static::getGitProjectName(static::$CONF->repo_url), $version);
     }
 
     /**
@@ -211,6 +236,14 @@ class Project extends \yii\db\ActiveRecord
      */
     public function afterSave($insert, $changedAttributes) {
         parent::afterSave($insert, $changedAttributes);
+        // 修改了项目repo_url，本地检出代码将被清空
+        if (isset($changedAttributes['repo_url'])) {
+            $projectDir = static::getDeployFromDir();
+            if (file_exists($projectDir)) {
+                $folder = new Folder($this);
+                $folder->removeLocalProjectWorkspace($projectDir);
+            }
+        }
         // 插入一条管理员关系
         if ($insert) {
             Group::addGroupUser($this->attributes['id'], [$this->attributes['user_id']], Group::TYPE_ADMIN);
@@ -226,5 +259,7 @@ class Project extends \yii\db\ActiveRecord
         parent::afterDelete();
         // 删除所有该项目的关系
         Group::deleteAll(['project_id' => $this->attributes['id']]);
+        // 删除本地目录
+
     }
 }

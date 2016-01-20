@@ -23,7 +23,8 @@ class Task extends Command {
         $tasks = GlobalHelper::str2arr($this->getConfig()->pre_deploy);
         if (empty($tasks)) return true;
 
-        $cmd = [];
+        // 本地可能要做一些依赖环境变量的命令操作
+        $cmd = ['source /etc/profile'];
         $workspace = rtrim(Project::getDeployWorkspace($version), '/');
         $pattern = [
             '#{WORKSPACE}#',
@@ -32,6 +33,8 @@ class Task extends Command {
             $workspace,
         ];
 
+        // 简化用户切换目录，直接切换到当前部署空间：{deploy_from}/{env}/{project}-YYmmdd-HHiiss
+        $cmd[] = "cd {$workspace}";
         foreach ($tasks as $task) {
             $cmd[] = preg_replace($pattern, $replace, $task);
         }
@@ -50,7 +53,8 @@ class Task extends Command {
         $tasks = GlobalHelper::str2arr($this->getConfig()->post_deploy);
         if (empty($tasks)) return true;
 
-        $cmd = [];
+        // 本地可能要做一些依赖环境变量的命令操作
+        $cmd = ['source /etc/profile'];
         $workspace = rtrim(Project::getDeployWorkspace($version), '/');
         $pattern = [
             '#{WORKSPACE}#',
@@ -59,6 +63,8 @@ class Task extends Command {
             $workspace,
         ];
 
+        // 简化用户切换目录，直接切换到当前部署空间：{deploy_from}/{env}/{project}-YYmmdd-HHiiss
+        $cmd[] = "cd {$workspace}";
         foreach ($tasks as $task) {
             $cmd[] = preg_replace($pattern, $replace, $task);
         }
@@ -67,17 +73,30 @@ class Task extends Command {
     }
 
     /**
-     * 同步代码之后触发任务
-     * 所有目标机器都部署完毕之后，做一些清理工作，如删除缓存、重启服务（nginx、php、task）
-     *
-     * @return bool
+     * 设置了版本保留数量，超出了设定值，则删除老版本
      */
-    public function postRelease($version) {
-        $tasks = GlobalHelper::str2arr($this->getConfig()->post_release);
-        if (empty($tasks)) return true;
+    public function cleanUpReleasesVersion() {
+        $cmd[] = sprintf('cd %s', Project::getReleaseVersionDir());
+        $cmd[] = 'ls -1|sort -r|awk \'FNR > ' . $this->config->keep_version_num . ' {printf("rm -rf %s\n", \$0);}\' | bash ';
 
-        $cmd = [];
-        $workspace = rtrim(Project::getDeployWorkspace($version), '/');
+        $command = join(' && ', $cmd);
+        return $this->runRemoteCommand($command);
+    }
+
+    /**
+     * 获取远程服务器要操作的任务命令
+     *
+     * @param $task    string
+     * @param $version string
+     * @return string string
+     */
+    public static function getRemoteTaskCommand($task, $version) {
+        $tasks = GlobalHelper::str2arr($task);
+        if (empty($tasks)) return '';
+
+        // 可能要做一些依赖环境变量的命令操作
+        $cmd = ['source /etc/profile'];
+        $workspace = Project::getTargetWorkspace();
         $version   = Project::getReleaseVersionDir($version);
         $pattern = [
             '#{WORKSPACE}#',
@@ -87,11 +106,25 @@ class Task extends Command {
             $workspace,
             $version,
         ];
+
+        // 简化用户切换目录，直接切换到当前的版本目录：{release_library}/{project}/{version}
+        $cmd[] = "cd {$version}";
         foreach ($tasks as $task) {
             $cmd[] = preg_replace($pattern, $replace, $task);
         }
-        $command = join(' && ', $cmd);
-        return $this->runLocalCommand($command);
+        return join(' && ', $cmd);
+    }
+
+    /**
+     * 执行远程服务器任务集合
+     * 对于目标机器更多的时候是一台机器完成一组命令，而不是每条命令逐台机器执行
+     *
+     * @param $tasks
+     * @return mixed
+     */
+    public function runRemoteTaskCommandPackage($tasks) {
+        $task = join(' && ', $tasks);
+        return $this->runRemoteCommand($task);
     }
 
 }
